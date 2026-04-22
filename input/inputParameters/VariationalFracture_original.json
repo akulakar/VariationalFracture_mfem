@@ -1,0 +1,16 @@
+{
+        "testName": "VariationalFracture_testrun1",
+        "Simulation Parameters": {
+                "Number of Steps": 25,
+                "Error Tolerance": 1e-4,
+                "Mesh Parameters": {
+                        "meshFileName": "../input/meshes/beam-hex.mesh",
+                        "order": 1,
+                        "ref_levels": 0
+                }
+        },
+        "Physical Parameters": {
+                "Lame Constant": 1e6,
+		"Shear Modulus": 1e5
+        }
+}

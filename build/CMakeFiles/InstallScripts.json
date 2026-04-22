@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/Aashutosh/Academic/Software/MFEM/projects/VariationalFracture/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,45 @@
+{
+	"configurations": [
+		{
+			"name": "Mac",
+			"includePath": [
+				"${workspaceFolder}/../../software/mfem/build",
+				"${workspaceFolder}/../../software/metis-5.1.0/include",
+				"${workspaceFolder}/../../software/hypre/src/hypre/include",
+				"${workspaceFolder}/../../software/mfemplus",
+				// "${workspaceFolder}/include",
+				"${workspaceFolder}/drivers",
+				"/opt/homebrew/Cellar/nlohmann-json/3.12.0/include",
+				"/opt/homebrew/opt/open-mpi/include",
+				"/opt/homebrew/Cellar/libomp/21.1.8/include",
+				"/opt/homebrew/opt/petsc/include",
+				"/opt/homebrew/opt/slepc/include",
+				"/opt/homebrew/opt/adios2/include",
+				// "/Users/Aashutosh/Academic/Software/gmsh/api",
+				"/Users/Aashutosh/Academic/Software/eigen-5.0.0/Eigen"
+			],
+			"defines": [],
+			"macFrameworkPath": [],
+			"compilerPath": "/usr/bin/clang++", // or g++ if you prefer
+			"cStandard": "c17",
+			"cppStandard": "c++17",
+			"intelliSenseMode": "macos-clang-arm64",
+			"browse": {
+			 "path" : [
+				"${workspaceFolder}/../../software/mfem/build",
+				"${workspaceFolder}/../../software/metis-5.1.0/include",
+				"${workspaceFolder}/../../software/hypre/src/hypre/include",
+				"${workspaceFolder}/../../software/mfemplus",
+				// "${workspaceFolder}/include",
+				"${workspaceFolder}/drivers",
+				"/opt/homebrew/Cellar/nlohmann-json/3.12.0/include",
+				"/opt/homebrew/opt/open-mpi/include",
+				"/opt/homebrew/Cellar/libomp/21.1.8/include",
+				// "/Users/Aashutosh/Academic/Software/gmsh/api",
+				"/Users/Aashutosh/Academic/Software/eigen-5.0.0/Eigen"
+			]
+		}
+		}
+	],
+	"version": 4
+}
