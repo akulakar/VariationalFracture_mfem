@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cmath>
 #include <string>
+#include <vector>
 #include <mfem.hpp>
 #include <mfemplus.hpp>
 #include <nlohmann/json.hpp>
@@ -18,16 +19,26 @@ using namespace mfem;
 using namespace std;
 using json = nlohmann::json;
 
+struct matProps
+{
+    double lameConstant, shearModulus;
+    double Ey, nu;
+    double Gc;
+    double eps;
+    double Kepsilon;
+};
+
 struct simProps
 {
-    double t_final; // final step
-    double dt_inc;  // step size
-    double dt_save; // save increment
-    int N;          // Number of steps
+    int N; // Number of steps
+    double errorTol;
+    int maxIterations;
+    vector<float> boundaryDisp;
 };
 
 std::tuple<int, int, int> GetNodeInfo(const mfem::GridFunction *nodes_ptr);
 bool readInputParameters(int argc, char *argv[], json &inputParameters);
+std::error_code logInFractureSim(json &inputParameters, matProps &fractureMatProps, simProps &fractureSimProps, mfem::ParMesh *mesh);
 
 class BoundaryConditions
 {
@@ -35,24 +46,24 @@ class BoundaryConditions
 private:
     json inputFile;
     mfem::ParMesh *pmesh;
-    mfem::ParFiniteElementSpace *pfespace;
+    mfem::ParFiniteElementSpace *fespacebc;
     mfem::Array<int> ess_bdr_x, ess_bdr_y, ess_bdr_z;
     mfem::Array<int> ess_tdof_list_x, ess_tdof_list_y, ess_tdof_list_z;
     const mfem::GridFunction *node_coords;
+    vector<float> boundaryDisp;
 
 protected:
-    double hat_u_x_func(const mfem::Vector &pt, double &time);
-    double hat_u_y_func(const mfem::Vector &pt, double &time);
-    double hat_u_z_func(const mfem::Vector &pt, double &time);
+    double hat_u_x_func(const mfem::Vector &pt, int &step);
+    double hat_u_y_func(const mfem::Vector &pt, int &step);
+    double hat_u_z_func(const mfem::Vector &pt, int &step);
 
 public:
-    BoundaryConditions(const json &inputParameters, mfem::ParMesh *mesh_in, mfem::ParFiniteElementSpace *fespace_bc) : inputFile(inputParameters), pmesh(mesh_in), pfespace(fespace_bc)
+    BoundaryConditions(const json &inputParameters, mfem::ParMesh *mesh_in, mfem::ParFiniteElementSpace *fespace_bc, vector<float> &boundary_displacements) : inputFile(inputParameters), pmesh(mesh_in), fespacebc(fespace_bc), boundaryDisp(boundary_displacements)
     {
         node_coords = pmesh->GetNodes();
     };
-
     int determineDirichletDof(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::ParGridFunction &hat_u_x_nodes, mfem::ParGridFunction &hat_u_y_nodes, mfem::ParGridFunction &hat_u_z_nodes);
-    int createDirichletVals(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::Vector &hat_u_x, mfem::Vector &hat_u_y, mfem::Vector &hat_u_z, double time);
+    int projectDirichletVals(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::Vector &hat_u_x, mfem::Vector &hat_u_y, mfem::Vector &hat_u_z, mfem::GridFunction &disp_gf, int step);
 };
 
 class PhaseFieldSolver
@@ -68,13 +79,13 @@ protected:
     ParLinearForm *fdisp, *fdmg;
     HypreParMatrix *KdispMat, *KdmgMat, *Kdmg1Mat, *Kdmg2Mat;
     HypreParVector *FdispVec, *FdmgVec;
-    HypreParVector *u_old, *u_new, *d_vec2, *d_max, *d_new;
+    HypreParVector *u_new, *d_vec2, *d_max, *d_new;
     HypreBoomerAMG *KdispPrec, *KdmgPrec;
     HyprePCG *KdispCG, *KdmgCG;
-    double local_damage_error, global_damage_error, error_tolerance;
+    double local_damage_error, global_damage_error;
 
 public:
-    PhaseFieldSolver(double error_tol) : error_tolerance(error_tol) {};
+    PhaseFieldSolver(ParGridFunction &disp_gf, ParGridFunction &damage_gf) : u(&disp_gf), d(&damage_gf) {};
     void ReadFESpacesMeshEssDofs(ParFiniteElementSpace *disp_fes, ParFiniteElementSpace *damage_fes, ParMesh *pmesh_in, Array<int> &ess_dofs)
     {
         dispfespace = disp_fes;
@@ -84,31 +95,23 @@ public:
         node_coords = pmesh->GetNodes();
     };
     // Read bilinear and linear forms.
-    void ReadBilinearLinearForms(ParBilinearForm *k_disp, ParBilinearForm *k_damage1, ParBilinearForm *k_damage2, ParLinearForm *f_disp, ParLinearForm *f_damage = nullptr)
+    void ReadBilinearLinearForms(ParBilinearForm *k_disp, ParBilinearForm *k_damage1, ParBilinearForm *k_damage2, ParLinearForm *f_disp, ParLinearForm *f_damage)
     {
         kdisp = k_disp;
         kdmg1 = k_damage1;
         kdmg2 = k_damage2;
         fdisp = f_disp;
-        fdmg = f_damage; // If no traction or body forces, this pointer is NULL.
-    };
-    // Read grid functions.
-    void ReadGridFunctions(ParGridFunction &disp_gf, ParGridFunction &damage_gf)
-    {
-        u = &disp_gf;
-        d = &damage_gf;
+        fdmg = f_damage;
     };
 
     void InitializeMatricesVectors(); // Initializes HypreParMatrices for bilinar forms. Initializes HypreParVectors for linear forms.
     void InitializeSolvers();
-    void ProjectDisplacementBCs();
     void AssembleKdispMatFdispVec();
     void ComputeDisp();
     void AssembleKdmg1Mat();
-    void AssembleKdmg2MatFdmgVec();
+    void AssembleKdmgMatFdmgVec();
     void ComputeDamage();
     double ComputeDamageError();
-    void UpdateGridFunctions();
     ~PhaseFieldSolver()
     {
         delete KdispMat;
@@ -116,6 +119,10 @@ public:
         delete Kdmg2Mat;
         delete FdispVec;
         delete FdmgVec;
+        delete u_new;
+        delete d_max;
+        delete d_vec2;
+        delete d_new;
         delete KdispPrec;
         delete KdmgPrec;
         delete KdispCG;
@@ -136,22 +143,23 @@ int main(int argc, char *argv[])
     // 		sleep(5);
     // }
 
-    StopWatch total_time, solver_time, postprocessing_time;
-    total_time.Start();
+    //------------------------------------------------------------------------------------------------------------------
+    // Initialize MPI, HYPRE, json, simProps and matProps
+    //------------------------------------------------------------------------------------------------------------------
 
-    // Initialize MPI and HYPRE.
     Mpi::Init(argc, argv);
     int num_procs = Mpi::WorldSize();
     int myid = Mpi::WorldRank();
     Hypre::Init();
     Device device("cpu");
-    // Print OpenMP threads
+
+    StopWatch total_time;
+    total_time.Start();
 
     json inputParameters;
     simProps fractureSimProps;
+    matProps fractureMatProps;
     readInputParameters(argc, argv, inputParameters); // read on every MPI rank.
-
-    fractureSimProps.N = 10;
 
     std::string mesh_file_str = inputParameters["Simulation Parameters"]["Mesh Parameters"]["meshFileName"];
     const char *mesh_file = mesh_file_str.c_str(); // open mesh file on every MPI rank. Create parallel mesh and delete mesh.
@@ -160,7 +168,9 @@ int main(int argc, char *argv[])
     // Add other relevant parameters.
 
     //------------------------------------------------------------------------------------------------------------------
-    // Read the mesh from the given mesh file.
+    // Read mesh and log in simulation info.
+    //------------------------------------------------------------------------------------------------------------------
+
     Mesh *mesh = new Mesh(mesh_file, 1, 1);
     int dim = mesh->Dimension();      // dim should equal 3.
     mesh->SetCurvature(order, false); // Enable high-order geometry
@@ -168,12 +178,11 @@ int main(int argc, char *argv[])
         mesh->UniformRefinement();
 
     ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
-
-    double lambda = 2.0;
-    double mu = 1.0;
+    logInFractureSim(inputParameters, fractureMatProps, fractureSimProps, pmesh);
 
     //------------------------------------------------------------------------------------------------------------------
     // Define finite element spaces.
+    //------------------------------------------------------------------------------------------------------------------
     // We are using elements close to Taylor-Hood elements.
     // P_{k} vector Lagrange elements for displacement and P_{k} scalar lagrage elements for damage;
 
@@ -183,21 +192,27 @@ int main(int argc, char *argv[])
     dispfespace = new ParFiniteElementSpace(pmesh, Lagrangefec, dim); // Define a vector H1 finite element space for nodal displacements.
     damagefespace = new ParFiniteElementSpace(pmesh, Lagrangefec, 1); // Define a scalar H1 finite element space for nodal pressures.
     pmesh->SetNodalFESpace(dispfespace);
+    pmesh->EnsureNodes();
 
-    // Define L2 finite element spaces for stress.
+    // Define L2 finite element spaces for strain and stress.
 
+    if (myid == 0)
+        cout << "Initialized finite element spaces" << endl;
     //------------------------------------------------------------------------------------------------------------------
     // Define and initialize all grid functions
+    //------------------------------------------------------------------------------------------------------------------
 
     ParGridFunction u(dispfespace), d(damagefespace);
     u = 0.0;
     d = 0.0;
 
-    // damagefespace is a scalar version of dispfespace, so will use it as the fespace for BCs.
     ParGridFunction hat_u_x_nodes(damagefespace), hat_u_y_nodes(damagefespace), hat_u_z_nodes(damagefespace);
     hat_u_x_nodes = 0.0;
     hat_u_y_nodes = 0.0;
     hat_u_z_nodes = 0.0;
+
+    if (myid == 0)
+        cout << "Initialized grid functions" << endl;
 
     //------------------------------------------------------------------------------------------------------------------
 
@@ -210,86 +225,76 @@ int main(int argc, char *argv[])
     const int num_els = dispfespace->GetNE();
 
     //------------------------------------------------------------------------------------------------------------------
-    // Read boundary attributes and determine essential dofs in each parition.
-    BoundaryConditions BCs(inputParameters, pmesh, damagefespace);
+    // Read boundary attributes and determine essential (Dirichlet) dofs.
+    //------------------------------------------------------------------------------------------------------------------
+    BoundaryConditions BCs(inputParameters, pmesh, dispfespace, fractureSimProps.boundaryDisp);
 
-    Array<int> ess_bdr_x(pmesh->bdr_attributes.Max()), ess_bdr_y(pmesh->bdr_attributes.Max()), ess_bdr_z(pmesh->bdr_attributes.Max());
     Array<int> ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, ess_tdof_list;
-
-    // BCs.determineDirichletDof(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x_nodes, hat_u_y_nodes, hat_u_z_nodes);
-    // ess_tdof_list.Append(ess_tdof_listbcx);
-    // ess_tdof_list.Append(ess_tdof_listbcy);
-    // ess_tdof_list.Append(ess_tdof_listbcz);
+    BCs.determineDirichletDof(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x_nodes, hat_u_y_nodes, hat_u_z_nodes);
+    ess_tdof_list.Append(ess_tdof_listbcx);
+    ess_tdof_list.Append(ess_tdof_listbcy);
+    if (dim == 3)
+        ess_tdof_list.Append(ess_tdof_listbcz);
     Vector hat_u_x(ess_tdof_listbcx.Size()), hat_u_y(ess_tdof_listbcy.Size()), hat_u_z(ess_tdof_listbcz.Size());
-    // BCs.createDirichletVals(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x, hat_u_y, hat_u_z, 0);
+    BCs.projectDirichletVals(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x, hat_u_y, hat_u_z, u, 0); // Can later modify the functions to remove redundant arguments.
 
-    // Project dirichlet values onto displacement grid function
+    if (myid == 0)
+        cout << "Initialized boundary conditions object" << endl;
 
     //------------------------------------------------------------------------------------------------------------------
-    if (myid == 0)
-        cout << "Assembling bilinear and linear forms" << endl;
+    // Bilinear and Linear forms.
+    //------------------------------------------------------------------------------------------------------------------
 
-    // Stiffness matrix for displacement (K_{u}) is the elastic strain energy multiplied by degradation function (1 - d^{2}) + k_{\varepsilon}
+    // Stiffness matrix for displacement (K_{u}) is the elastic strain energy multiplied by degradation function (1 - d)^{2} + k_{\varepsilon}
     // Stiffness matrix and corresponding boundary dislacements load term is recomputed at every iteration and sub iteration.
 
-    // Stiffness matrix 1 for damage (K_{d1}) is computed only once per iteration (not during sub iterations);
+    // Stiffness matrix 1 for damage (K_{d1}) is computed only once.
     // Stiffness matrix 2 for damage (K_{d2}) is computed every sub iteration.
     // Load vector for damage (F_{d}) is computed every sub iteration.
 
     // In total:
-    // 1 bilinear form for displacement, possibly 1 linear form for displacement if growth term is included.
+    // 1 bilinear form and 1 linear form for displacement.
     // 2 bilinear forms and 1 linear for for damage.
     // Set up bilinear forms with integrators and pass pointers to the solver class. In the class the bilinear forms will be assembled as required.
 
-    // Define bilinear and mixed forms.
-    // Stiffness matrix for displacement term
-    // Need a coefficient value for each computational node. Stiffness matrix depends on damage d at each node... (or element?)
-    // But quadrature points are not the same as nodal points... So need to construct an interpolant in each element with shape functions and evaluate damage at each quadrature point...
+    //------------------------------------------------------------------------------------------------------------------
+    // Bilinear forms
 
-    // Kdisp
-    double Ey = mu * (3 * lambda + 2 * mu) / (lambda + mu);
-    double nu = lambda / (2 * (lambda + mu));
-    double Keps = 1.0e-7;
-    ConstantCoefficient Ey_coeff(Ey), nu_coeff(nu);
-
+    // kdisp
+    ConstantCoefficient Ey_coeff(fractureMatProps.Ey), nu_coeff(fractureMatProps.nu);
+    // Computes degradation term at each quadrature point.
     ParBilinearForm *kdisp(new ParBilinearForm(dispfespace));
-    kdisp->AddDomainIntegrator(new mfemplus::IsotropicElasticityDamageIntegrator(Ey_coeff, nu_coeff, Keps, d, damagefespace));
-    // kdisp->Assemble();
-    // Looks good for now.
+    kdisp->AddDomainIntegrator(new mfemplus::IsotropicElasticityDamageIntegrator(Ey_coeff, nu_coeff, fractureMatProps.Kepsilon, d, damagefespace));
 
-    // Kdmg1
-    double g = 0.4;
-    double epsilon = 0.2;
-    ConstantCoefficient g_over_eps_coeff(g / epsilon), g_times_eps_coeff(g * epsilon);
-
+    // kdmg1
+    ConstantCoefficient g_over_eps_coeff(fractureMatProps.Gc / fractureMatProps.eps), g_times_eps_coeff(fractureMatProps.Gc * fractureMatProps.eps);
+    // Assembled only once in the simulation.
     ParBilinearForm *kdmg1(new ParBilinearForm(damagefespace));
     kdmg1->AddDomainIntegrator(new MassIntegrator(g_over_eps_coeff));
     kdmg1->AddDomainIntegrator(new DiffusionIntegrator(g_times_eps_coeff));
-    // kdmg1->Assemble();
-    // Looks good. This term is simple.
 
-    // Kdmg2
-    // Need to compute the stress : strain inner product at each quad point.
+    // kdmg2
+    // Computes the elastic energy at each quadrature point.
     ParBilinearForm *kdmg2(new ParBilinearForm(damagefespace));
     kdmg2->AddDomainIntegrator(new mfemplus::IsotropicStrainEnergyDamageIntegrator(Ey_coeff, nu_coeff, u, dispfespace));
-    // kdmg2->Assemble();
-    // Looks good for now.
 
+    //------------------------------------------------------------------------------------------------------------------
     // Linear forms
 
     // fdisp
     ParLinearForm *fdisp(new ParLinearForm(dispfespace));
-    // fdisp->Assemble(); // 0 if no body forces.
+    // If growth term is needed, include a body force.
+    // fdisp->AddDomainIntegrator(new DomainLFIntegrator(expansionCoeff));
 
     // fdmg
-    // Need to compute the stress :: strain inner product for this too at each quad point.
+    // Computes the elastic energy at each quadrature point.
     ParLinearForm *fdmg(new ParLinearForm(damagefespace));
-    fdmg->AddDomainIntegrator(new mfemplus::FractureDamageLFIntegrator(Ey_coeff, nu_coeff, u, dispfespace)); // Wrong coeff, need to change.
-    // fdmg->Assemble();
-    // Looks good for now.
+    fdmg->AddDomainIntegrator(new mfemplus::FractureDamageLFIntegrator(Ey_coeff, nu_coeff, u, dispfespace));
 
+    if (myid == 0)
+        cout << "Initialized bilinear and linear forms." << endl;
+    // -----------------------------------------------------------------------------------------------------------------
     // Set up object to save data
-
     std::string resultsFolder = "../results/" + inputParameters["testName"].get<std::string>();
 
     adios2stream aos(resultsFolder + "/WavesMFEMoutput.bp", adios2stream::openmode::out, MPI_COMM_WORLD, "BP5");
@@ -298,58 +303,79 @@ int main(int argc, char *argv[])
         aos.SetParameter("FlushStepsCount", "5");
         aos.BeginStep();
         pmesh->Print(aos);
+        aos.SetCycle(0);
         // Write fields
         u.Save(aos, "disp", adios2stream::data_type::point_data);
         d.Save(aos, "damage", adios2stream::data_type::point_data);
         hat_u_x_nodes.Save(aos, "hat_u_x_nodes", adios2stream::data_type::point_data);
-        hat_u_x_nodes.Save(aos, "hat_u_y_nodes", adios2stream::data_type::point_data);
+        hat_u_y_nodes.Save(aos, "hat_u_y_nodes", adios2stream::data_type::point_data);
+        hat_u_z_nodes.Save(aos, "hat_u_z_nodes", adios2stream::data_type::point_data);
         aos.EndStep();
     }
+
+    if (myid == 0)
+        cout << "Initialized output stream object." << endl;
+
     //------------------------------------------------------------------------------------------------------------------
-    // Initialize the main fracture class.
+    // Initialize the main phase field solver object and begin iterations.
+    //------------------------------------------------------------------------------------------------------------------
 
-    double error_tol = 1e-5;
-
-    PhaseFieldSolver PhaseFieldFractureSolver(error_tol);
-
+    PhaseFieldSolver PhaseFieldFractureSolver(u, d);
     PhaseFieldFractureSolver.ReadFESpacesMeshEssDofs(dispfespace, damagefespace, pmesh, ess_tdof_list);
     PhaseFieldFractureSolver.ReadBilinearLinearForms(kdisp, kdmg1, kdmg2, fdisp, fdmg);
-    PhaseFieldFractureSolver.ReadGridFunctions(u, d);
     PhaseFieldFractureSolver.InitializeMatricesVectors();
     PhaseFieldFractureSolver.InitializeSolvers();
 
-    double damage_error = 1.0; // Initializing.
-    // double time = fractureSimProps.dt_inc;
-    int max_iterations = 100;
+    double damage_error = 1.0;
     int iterations = 0;
 
-    for (int step = 1; step <= fractureSimProps.N; step++)
-    {
-        if (step == 1)
-        {
-            // Kdmg1Mat is only assembled once during the entire simulation. Slightly weird...
-            PhaseFieldFractureSolver.AssembleKdmg1Mat();
-        }
+    if (myid == 0)
+        cout << "Initialized fracture solver. Loop starting." << endl;
 
-        // BCs.createDirichletVals(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x, hat_u_y, hat_u_z, step);
+    for (int step = 1; step < fractureSimProps.N; step++)
+    {
+        // Kdmg1Mat is only assembled once during the entire simulation.
+        if (step == 1)
+            PhaseFieldFractureSolver.AssembleKdmg1Mat();
 
         damage_error = 1.0;
         iterations = 0;
-        while (damage_error >= error_tol && iterations <= max_iterations)
-        {
 
-            PhaseFieldFractureSolver.ProjectDisplacementBCs();
+        while (damage_error >= fractureSimProps.errorTol && iterations <= fractureSimProps.maxIterations)
+        {
+            if (myid == 0)
+                cout << "Step " << step << " iteration " << iterations << endl;
+
+            // Project essential bcs.
+            BCs.projectDirichletVals(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x, hat_u_y, hat_u_z, u, step);
+
+            // Assemble KdispMat and FdispVec and solve for displacement.
             PhaseFieldFractureSolver.AssembleKdispMatFdispVec();
             PhaseFieldFractureSolver.ComputeDisp();
-            // Computed displacements.
 
-            PhaseFieldFractureSolver.AssembleKdmg2MatFdmgVec();
+            // Assemble KdmgMat and FdmgVec and solve for displacement.
+            PhaseFieldFractureSolver.AssembleKdmgMatFdmgVec();
             PhaseFieldFractureSolver.ComputeDamage();
-            // Now need to compute the max damage at each computational node.
+
+            // Compute error in damage.
             damage_error = PhaseFieldFractureSolver.ComputeDamageError();
+            iterations++;
         };
 
-        if (iterations >= max_iterations && myid == 0)
+        if (myid == 0)
+            cout << "Step " << step << " took " << iterations << " iterations" << endl;
+
+        aos.BeginStep();
+        pmesh->Print(aos);
+        if (myid == 0)
+        {
+            aos.SetCycle(step);
+        }
+        u.Save(aos, "disp", adios2stream::data_type::point_data);
+        d.Save(aos, "damage", adios2stream::data_type::point_data);
+        aos.EndStep();
+
+        if (iterations >= fractureSimProps.maxIterations && myid == 0)
         {
             cout << "Failed. Damage field did not converge!" << endl;
             // kill program.
@@ -357,7 +383,17 @@ int main(int argc, char *argv[])
             std::cerr << "Failed. Damage field did not converge!" << ec.message() << std::endl;
             _exit(2);
         }
+        if (myid == 0)
+            cout << "Completed step " << step << endl;
     }
+
+    //------------------------------------------------------------------------------------------------------------------
+    // Release memory.
+    //-----------------------
+
+    total_time.Stop();
+    if (myid == 0)
+        cout << "Simulation completed. Took " << total_time.RealTime() << " seconds." << endl;
 
     delete pmesh;
     delete Lagrangefec;
@@ -410,154 +446,317 @@ bool readInputParameters(int argc, char *argv[], json &inputParameters)
     return 0;
 }
 
+std::error_code logInFractureSim(json &inputParameters, matProps &fractureMatProps, simProps &fractureSimProps, mfem::ParMesh *mesh)
+{
+    int myid = Mpi::WorldRank();
+    int numids = Mpi::WorldSize();
+
+    std::string resultsFolder = "../results/" + inputParameters["testName"].get<std::string>();
+    // std::string resultsFolder = "/users/akulaka1/scratch/MFEMresults/" + inputParameters["testName"].get<std::string>();
+
+    // Only create folders on master rank to avoid conflicts
+    if (myid == 0)
+    {
+        if (fs::exists(resultsFolder))
+        {
+            std::error_code ec;
+            fs::remove_all(resultsFolder, ec); // remove all contents recursively
+            if (ec)
+            {
+                std::cerr << "Error removing folder: " << ec.message() << std::endl;
+                return ec;
+            }
+        }
+        // Recreate a fresh empty directory
+        fs::create_directories(resultsFolder);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    fractureMatProps.lameConstant = inputParameters["Physical Parameters"]["Lame Constant"];
+    fractureMatProps.shearModulus = inputParameters["Physical Parameters"]["Shear Modulus"];
+    fractureMatProps.Gc = inputParameters["Physical Parameters"]["Gc"];
+    fractureMatProps.eps = inputParameters["Physical Parameters"]["epsilon"];
+    fractureMatProps.Kepsilon = inputParameters["Physical Parameters"]["Kepsilon"];
+
+    double E, NU;
+    E = (fractureMatProps.shearModulus * (3 * fractureMatProps.lameConstant + 2 * fractureMatProps.shearModulus)) / (fractureMatProps.lameConstant + fractureMatProps.shearModulus);
+    NU = fractureMatProps.lameConstant / (2 * (fractureMatProps.lameConstant + fractureMatProps.shearModulus));
+    double h = mesh->GetElementSize(1, /*type=*/1);
+
+    fractureMatProps.Ey = E;
+    fractureMatProps.nu = NU;
+
+    if (myid == 0)
+        cout << "Physical parameters read" << endl;
+
+    fractureSimProps.errorTol = inputParameters["Simulation Parameters"]["Error Tolerance"];
+    fractureSimProps.maxIterations = inputParameters["Simulation Parameters"]["Maximum Iterations"];
+    fractureSimProps.boundaryDisp = inputParameters["Simulation Parameters"]["Boundary Displacements"].get<std::vector<float>>();
+    fractureSimProps.N = (fractureSimProps.boundaryDisp).size();
+
+    if (myid == 0)
+        cout
+            << "Simulation parameters read" << endl;
+
+    int total_elements(0), local_elements(mesh->GetNE());
+    MPI_Allreduce(&local_elements, &total_elements, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    // Save simulation details on master rank
+    if (myid == 0)
+    {
+        ofstream u_data(resultsFolder + "/" + "SimulationDetails.txt");
+
+        u_data << "saved output to " + resultsFolder << endl;
+
+        u_data << "Ey\t" << E << endl;
+        u_data << "nu\t" << NU << endl;
+        u_data << "Number of steps \t" << fractureSimProps.N << endl;
+        u_data << "\n\n";
+        u_data << "Mesh Details";
+        u_data << "\n\n";
+        u_data << "order: " << inputParameters["Simulation Parameters"]["Mesh Parameters"]["order"] << "\n";
+        u_data << "ref_levels: " << inputParameters["Simulation Parameters"]["Mesh Parameters"]["ref_levels"] << "\n";
+        u_data << "Number of elements: " << total_elements << "\n";
+
+        u_data.close();
+    }
+
+    return {};
+};
+
 //----------------------------------------------------------------------------------------------------------------------------------------------
 // BoundaryConditions methods defined here.
 //----------------------------------------------------------------------------------------------------------------------------------------------
 int BoundaryConditions::determineDirichletDof(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::ParGridFunction &hat_u_x_nodes, mfem::ParGridFunction &hat_u_y_nodes, mfem::ParGridFunction &hat_u_z_nodes)
 {
+    // Every rank needs to have the same lists!
     int myid = Mpi::WorldRank();
+    int dim = pmesh->Dimension();
 
-    mfem::Array<int> bdr_nodes_list;
-    // pfespace->GetBoundaryTrueDofs(bdr_nodes_list, 0); // This didn't work, so doing roundabout way instead.
+    mfem::Array<int> bdr_nodes_list_x, bdr_nodes_list_y;
+    mfem::Array<int> bdr_nodes_list_z;
 
-    mfem::Array<int> all_bdr_attr_selector(pmesh->bdr_attributes.Max());
-    // mfem::Array<int> all_bdr_attr_selector(1);
-    // First attribute is for the dirichlet nodes.
-    all_bdr_attr_selector = 0;
-    all_bdr_attr_selector[0] = 1; // only first attribute is dirichlet...
-    // all_bdr_attr_selector = 1;
-    GridFunction nodes(pfespace);
-    nodes = 0.0;
-    ConstantCoefficient one(1.0);
-    nodes.ProjectBdrCoefficient(one, all_bdr_attr_selector);
+    ess_bdr_x.SetSize(pmesh->bdr_attributes.Max());
+    ess_bdr_y.SetSize(pmesh->bdr_attributes.Max());
+    ess_bdr_z.SetSize(pmesh->bdr_attributes.Max());
 
-    for (int i = 0; i < nodes.Size(); i++)
-        if (nodes(i) != 0.0)
-            bdr_nodes_list.Append(i);
+    ess_bdr_x = 0;
+    ess_bdr_y = 0;
+    ess_bdr_z = 0;
 
-    auto [num_dofs, vdim, num_nodes] = GetNodeInfo(node_coords);
+    // Select Dirichlet components.
+    ess_bdr_x[2] = 1;
+    ess_bdr_y[2] = 1;
+    ess_bdr_z[2] = 1;
+
+    ess_bdr_y[3] = 1;
+
+    fespacebc->GetEssentialTrueDofs(ess_bdr_x, ess_tdof_listx, 0);
+    fespacebc->GetEssentialTrueDofs(ess_bdr_y, ess_tdof_listy, 1);
+    fespacebc->GetEssentialTrueDofs(ess_bdr_z, ess_tdof_listz, 2);
+
+    // fespacebc->GetEssentialTrueDofs(ess_bdr_x, bdr_nodes_list_x, 0);
+    // fespacebc->GetEssentialTrueDofs(ess_bdr_y, bdr_nodes_list_y, 1);
+    // fespacebc->GetEssentialTrueDofs(ess_bdr_z, bdr_nodes_list_z, 2);
+
+    // GridFunction nodesx(fespacebc), nodesy(fespacebc);
+    // GridFunction nodesz(fespacebc); // scalar valued fespace.
+    // nodesx = 0.0;
+    // nodesy = 0.0;
+    // nodesz = 0.0; // initialize, important.
+    // ConstantCoefficient one(1.0);
+    // nodesx.ProjectBdrCoefficient(one, ess_bdr_x);
+    // nodesy.ProjectBdrCoefficient(one, ess_bdr_y);
+    // nodesz.ProjectBdrCoefficient(one, ess_bdr_z);
+
+    // for (int i = 0; i < nodesx.Size(); i++)
+    // {
+    //     if (nodesx(i) != 0.0)
+    //         bdr_nodes_list_x.Append(i);
+    //     if (nodesy(i) != 0.0)
+    //         bdr_nodes_list_y.Append(i);
+    //     if (nodesz(i) != 0.0)
+    //         bdr_nodes_list_z.Append(i);
+    // }
+
+    // auto [num_dofs, vdim, num_nodes] = GetNodeInfo(node_coords);
 
     // MFEM_VERIFY(nodes, "Mesh has no nodes. Did you call SetCurvature or SetNodalFESpace?");
+    // mfem::Vector pt(dim);
 
-    double max_coord = 0;
-    double temp;
-    for (auto nd : bdr_nodes_list)
-    {
-        temp = (*node_coords)(nd);
-        max_coord = std::max(max_coord, abs(temp));
-    }
-    max_coord -= 0.0008;
+    // for (auto nd : bdr_nodes_list_x)
+    // {
+    // pt(0) = (*node_coords)(nd);
+    // pt(1) = (*node_coords)(nd + num_nodes);
+    // if (dim == 3)
+    //     pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    // if (pt(1) <= 0.0001)
+    // {
+    // // ess_tdof_listx.Append(nd);
+    // hat_u_x_nodes(nd) = 1.0;
+    //     }
+    // }
 
-    for (auto nd : bdr_nodes_list)
-    {
-        mfem::Vector pt(3);
-        pt(0) = (*node_coords)(nd);
-        pt(1) = (*node_coords)(nd + num_nodes);
-        pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    // for (auto nd : bdr_nodes_list_y)
+    // {
+    // pt(0) = (*node_coords)(nd);
+    // pt(1) = (*node_coords)(nd + num_nodes);
+    // if (dim == 3)
+    //     pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    // if (pt(1) <= 0.0001 || pt(1) >= (0.04 - 0.0001)) // Bottom and top boundaries. Don't use manual coord specification. Automate.
+    // {
+    // ess_tdof_listy.Append(nd + num_nodes);
+    // hat_u_y_nodes(nd) = 1.0;
+    // }
+    // }
 
-        // All nodes in this atribute are Dirichlet nodes. No constraint on coordinates.
-        // All three vector dofs are fixed.
+    // if (dim == 3)
+    // {
+    //     for (auto nd : bdr_nodes_list_z)
+    //     {
+    // pt(0) = (*node_coords)(nd);
+    // pt(1) = (*node_coords)(nd + num_nodes);
+    // if (dim == 3)
+    //     pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    // if (pt(1) <= 0.0001)
+    // {
+    // ess_tdof_listz.Append(nd + 2 * num_nodes);
+    // hat_u_z_nodes(nd) = 1.0;
+    //         }
+    //     }
+    // }
 
-        // if ((pt(1) <= -0.0784) && (std::abs(pt(0)) <= 0.037) && (std::abs(pt(2)) <= 0.037))
-        // if ((pt(0) * pt(0)) + (pt(1) * pt(1)) + (pt(2) * pt(2)) >= (max_coord * max_coord))
-        {
-            ess_tdof_listx.Append(nd);
-            hat_u_x_nodes(nd) = 1.0;
-
-            ess_tdof_listy.Append(nd);
-            hat_u_y_nodes(nd) = 1.0;
-
-            ess_tdof_listz.Append(nd);
-            hat_u_z_nodes(nd) = 1.0;
-        }
-    }
     return 0;
 }
-
 // Boudary conditions need to be a function of time.
-double BoundaryConditions::hat_u_x_func(const mfem::Vector &pt, double &time)
+double BoundaryConditions::hat_u_x_func(const mfem::Vector &pt, int &step)
 {
-    // double x1 = pt(0);
-    // double x2 = pt(1);
-    // double x3 = pt(2);
+    return 0.0; // Homogeneous Dirichlet condition.
+}
+
+double BoundaryConditions::hat_u_y_func(const mfem::Vector &pt, int &step)
+{
+    if (pt(1) >= (0.04 - 0.0001) /*&& std::abs(pt(1) - 0.05) <= 0.0001*/)
+        return -boundaryDisp[step]; // Step dependent inhomogeneous Dirichlet condition
+    else
+        return 0.0;
+}
+
+double BoundaryConditions::hat_u_z_func(const mfem::Vector &pt, int &step)
+{
     return 0.0; // Homogeneous Dirichlet condition
 }
 
-double BoundaryConditions::hat_u_y_func(const mfem::Vector &pt, double &time)
+int BoundaryConditions::projectDirichletVals(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::Vector &hat_u_x, mfem::Vector &hat_u_y, mfem::Vector &hat_u_z, mfem::GridFunction &disp_gf, int step)
 {
-    // double x1 = pt(0);
-    // double x2 = pt(1);
-    // double x3 = pt(2);
-    return 0.0; // Homogeneous Dirichlet condition
-}
+    int dim = pmesh->Dimension();
+    // auto [num_dofs, vdim, num_nodes] = GetNodeInfo(node_coords);
+    disp_gf = 0.0;
 
-double BoundaryConditions::hat_u_z_func(const mfem::Vector &pt, double &time)
-{
-    // double x1 = pt(0);
-    // double x2 = pt(1);
-    // double x3 = pt(2);
-    return 0.0; // Homogeneous Dirichlet condition
-}
+    VectorArrayCoefficient dirichletBC(dim);
+    Vector dispbcx(pmesh->bdr_attributes.Max()), dispbcy(pmesh->bdr_attributes.Max());
+    dispbcy = 0.0;                      // First attribute is homogeneous dirichlet boundary.
+    dispbcy(3) = -(boundaryDisp[step]); // Second attribute is inhomogeneous dirichlet boundary.
 
-int BoundaryConditions::createDirichletVals(mfem::Array<int> &ess_tdof_listx, mfem::Array<int> &ess_tdof_listy, mfem::Array<int> &ess_tdof_listz, mfem::Vector &hat_u_x, mfem::Vector &hat_u_y, mfem::Vector &hat_u_z, double time)
-{
-    auto [num_dofs, vdim, num_nodes] = GetNodeInfo(node_coords);
-    mfem::Vector pt{0.0, 0.0, 0.0};
-    int i = 0;
-    for (auto nd : ess_tdof_listx)
-    {
+    dirichletBC.Set(0, new ConstantCoefficient(0.0));
+    dirichletBC.Set(1, new PWConstCoefficient(dispbcy));
+    if (dim == 3)
+        dirichletBC.Set(2, new ConstantCoefficient(0.0));
 
-        pt[0] = (*node_coords)(nd);
-        pt[1] = (*node_coords)(nd + num_nodes);
-        pt[2] = (*node_coords)(nd + 2 * num_nodes);
-        hat_u_x(i) = hat_u_x_func(pt, time);
-        i++;
-    }
-    i = 0;
-    for (auto nd : ess_tdof_listy)
-    {
+    disp_gf.ProjectBdrCoefficient(dirichletBC, ess_bdr_y); // Ahh this is useless if we want to have different dirichlet boundaries for each component of displacement.
 
-        pt[0] = (*node_coords)(nd);
-        pt[1] = (*node_coords)(nd + num_nodes);
-        pt[2] = (*node_coords)(nd + 2 * num_nodes);
-        hat_u_y(i) = hat_u_y_func(pt, time);
-        i++;
-    }
-    i = 0;
-    for (auto nd : ess_tdof_listz)
-    {
+    // mfem::Vector pt{0.0, 0.0, 0.0};
+    // int i = 0;
+    // for (auto nd : ess_tdof_listx)
+    // {
+    //     pt(0) = (*node_coords)(nd);
+    //     pt(1) = (*node_coords)(nd + num_nodes);
+    //     if (dim == 3)
+    //         pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    //     hat_u_x(i) = hat_u_x_func(pt, step);
+    //     i++;
+    // }
+    // i = 0;
+    // for (auto nd : ess_tdof_listy)
+    // {
+    //     nd -= num_nodes; // Offset by num_nodes for ess_tdof_listy
+    //     pt(0) = (*node_coords)(nd);
+    //     pt(1) = (*node_coords)(nd + num_nodes);
+    //     if (dim == 3)
+    //         pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    //     hat_u_y(i) = hat_u_y_func(pt, step);
+    //     i++;
+    // }
+    // i = 0;
+    // if (dim == 3)
+    // {
+    //     for (auto nd : ess_tdof_listz)
+    //     {
+    //         nd -= 2 * num_nodes; // Offset by 2 * num_nodes for ess_tdof_listz
+    //         pt(0) = (*node_coords)(nd);
+    //         pt(1) = (*node_coords)(nd + num_nodes);
+    //         if (dim == 3)
+    //             pt(2) = (*node_coords)(nd + 2 * num_nodes);
+    //         hat_u_z(i) = hat_u_z_func(pt, step);
+    //         i++;
+    //     }
+    // }
+    // // Now set values in grid function.
+    // {
+    //     int i = 0;
+    //     for (auto nd : ess_tdof_listx)
+    //     {
+    //         disp_gf(nd) = hat_u_x(i);
+    //         i++;
+    //     }
 
-        pt[0] = (*node_coords)(nd);
-        pt[1] = (*node_coords)(nd + num_nodes);
-        pt[2] = (*node_coords)(nd + 2 * num_nodes);
-        hat_u_z(i) = hat_u_z_func(pt, time);
-        i++;
-    }
+    //     i = 0;
+    //     for (auto nd : ess_tdof_listy)
+    //     {
+    //         disp_gf(nd) = hat_u_y(i);
+    //         i++;
+    //     }
 
+    //     if (dim == 3)
+    //     {
+    //         i = 0;
+    //         for (auto nd : ess_tdof_listz)
+    //         {
+    //             disp_gf(nd) = hat_u_z(i);
+    //             i++;
+    //         }
+    //     }
+    // }
     return 0;
 }
 
-//
-//
+//--------------------------------------------------------------------------------------------------------------------------------------------
 // Damage displacement solver for fracture methods defined here.
+//--------------------------------------------------------------------------------------------------------------------------------------------
 void PhaseFieldSolver::InitializeMatricesVectors()
 {
-    u_old = new HypreParVector(dispfespace);
+    // Matrices
+    KdispMat = new HypreParMatrix();
+    KdmgMat = new HypreParMatrix();
+
+    // Vectors
     u_new = new HypreParVector(dispfespace);
 
     d_vec2 = new HypreParVector(damagefespace);
     d_max = new HypreParVector(damagefespace);
     d_new = new HypreParVector(damagefespace);
 
+    FdispVec = new HypreParVector(dispfespace);
+    FdmgVec = new HypreParVector(damagefespace);
+
     // Initialize vectors
-    (*u_old) = (*u_new) = 0.0;
+    (*u_new) = 0.0;
     (*d_vec2) = (*d_max) = (*d_new) = 0.0;
+    (*FdispVec) = 0.0;
+    (*FdmgVec) = 0.0;
 }
 
 void PhaseFieldSolver::InitializeSolvers()
 {
-    // This may not work because the pointer is null, but it initializes by pointer...
-    // Maybe the better way to do this is to set up the first initialization outside the class in the main script and then pass it to the class.
     KdispPrec = new HypreBoomerAMG();
     KdmgPrec = new HypreBoomerAMG();
 
@@ -572,48 +771,57 @@ void PhaseFieldSolver::InitializeSolvers()
     KdmgPrec->SetRelaxType(6); // Symm. Gauss-Seidel
     KdmgPrec->SetCycleType(1);
 
-    KdispCG->SetTol(1e-10);
+    KdispCG->SetTol(1e-12);
     KdispCG->SetMaxIter(1000);
     KdispCG->SetPrintLevel(0);
-    KdispCG->SetPreconditioner(*KdispPrec);
 
-    KdmgCG->SetTol(1e-10);
+    KdmgCG->SetTol(1e-12);
     KdmgCG->SetMaxIter(1000);
     KdmgCG->SetPrintLevel(0);
-    KdmgCG->SetPreconditioner(*KdmgPrec);
 }
-
-void PhaseFieldSolver::ProjectDisplacementBCs() {};
 
 void PhaseFieldSolver::AssembleKdispMatFdispVec()
 {
     // displacement boundary conditions already projected onto u.
+    kdisp->Update(dispfespace);
     kdisp->Assemble();
     kdisp->Finalize();
-    // Currently this line doesn't work due to "MFEM abort: Unknown host memory controller!"
+
+    fdisp->Assemble();
+
     kdisp->FormLinearSystem(ess_tdof_list, *u, *fdisp, *KdispMat, *u_new, *FdispVec);
 };
 void PhaseFieldSolver::ComputeDisp()
 {
+    int myid = Mpi::WorldRank();
+
     KdispPrec->SetOperator(*KdispMat);
     KdispCG->SetOperator(*KdispMat);
     KdispCG->SetPreconditioner(*KdispPrec);
 
-    KdispCG->Mult(*FdispVec, *u_new); // u_new = KdispMat^{-1} (F_disp)
+    KdispCG->Mult(*FdispVec, *u_new);                 // u_new = KdispMat^{-1} (F_disp)
+    kdisp->RecoverFEMSolution(*u_new, *FdispVec, *u); // Update grid function.
 };
 
-void PhaseFieldSolver::AssembleKdmg1Mat() // This method need not be called every sub iteration.
+void PhaseFieldSolver::AssembleKdmg1Mat() // This method needs to be called only once.
 {
     kdmg1->Assemble();
     kdmg1->Finalize();
     Kdmg1Mat = (kdmg1->ParallelAssemble()); // Reassign the pointer. Ownership transferred.
+
+    // Additionally, since this method is only called once, will use this to initialize KdmgMat too.
+    *KdmgMat = *(kdmg1->ParallelAssemble()); // Initialize object.
+    *KdmgMat = 0.0;
 };
 
-void PhaseFieldSolver::AssembleKdmg2MatFdmgVec() // Kdmg2Mat and FdmgVec depend on displacement u.
+void PhaseFieldSolver::AssembleKdmgMatFdmgVec() // Kdmg2Mat and FdmgVec depend on displacement u.
 {
+    kdmg2->Update(damagefespace);
     kdmg2->Assemble();
     kdmg2->Finalize();
     Kdmg2Mat = (kdmg2->ParallelAssemble()); // Reassign the pointer. Ownership transferred.
+
+    KdmgMat = Add(1.0, *Kdmg1Mat, 1.0, *Kdmg2Mat);
 
     fdmg->Assemble();
     FdmgVec = fdmg->ParallelAssemble();
@@ -621,20 +829,16 @@ void PhaseFieldSolver::AssembleKdmg2MatFdmgVec() // Kdmg2Mat and FdmgVec depend 
 
 void PhaseFieldSolver::ComputeDamage()
 {
-    KdmgMat->Add(1.0, *Kdmg1Mat);
-    KdmgMat->Add(1.0, *Kdmg2Mat);
-
     KdmgPrec->SetOperator(*KdmgMat);
     KdmgCG->SetOperator(*KdmgMat);
     KdmgCG->SetPreconditioner(*KdmgPrec);
 
-    KdmgCG->Mult(*FdmgVec, *d_vec2); // d_new = KdmgMat^{-1} (F_dmg)
+    KdmgCG->Mult(*FdmgVec, *d_vec2); // d_vec2 = KdmgMat^{-1} (F_dmgVec)
 };
 
 double PhaseFieldSolver::ComputeDamageError()
 {
-
-    for (int n = 0; n < d_vec2->Size(); n++)
+    for (int n = 0; n < d_max->Size(); n++)
     {
         (*d_max)(n) = fmax((*d_vec2)(n), (*d_new)(n));
     }
@@ -645,13 +849,7 @@ double PhaseFieldSolver::ComputeDamageError()
     MPI_Allreduce(&local_damage_error, &global_damage_error, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     *d_new = *d_max;
+    *d = *d_new;
 
     return global_damage_error;
-};
-
-void PhaseFieldSolver::UpdateGridFunctions()
-{
-    // Grid functions are set to hypreparvector values.
-    *u = *u_new;
-    *d = *d_new;
 };

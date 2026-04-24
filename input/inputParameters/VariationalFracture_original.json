@@ -2,15 +2,22 @@
         "testName": "VariationalFracture_testrun1",
         "Simulation Parameters": {
                 "Number of Steps": 25,
-                "Error Tolerance": 1e-4,
+                "Error Tolerance": 1e-5,
+                "Maximum Iterations": 100,
                 "Mesh Parameters": {
-                        "meshFileName": "../input/meshes/beam-hex.mesh",
+                        "meshFileName": "../input/meshes/SlabWithNotch2-tet.mesh",
                         "order": 1,
                         "ref_levels": 0
-                }
+                },
+                "Boundary Displacements": [0.0, 0.001],
+                "All Boundary Displacements": [0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.010]
         },
         "Physical Parameters": {
-                "Lame Constant": 1e6,
-		"Shear Modulus": 1e5
+                "Lame Constant": 12000,
+		"Shear Modulus": 8000,
+                "Fracture Toughness": 5e-3,
+                "Kepsilon": 1e-7,
+                "Gc": 0.005,
+                "epsilon" : 0.05 
         }
 }
