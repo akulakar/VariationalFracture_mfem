@@ -112,6 +112,7 @@ public:
     void AssembleKdmgMatFdmgVec();
     void ComputeDamage();
     double ComputeDamageError();
+    void SuppressBoundaryDamage();
     ~PhaseFieldSolver()
     {
         delete KdispMat;
@@ -356,6 +357,7 @@ int main(int argc, char *argv[])
             // Assemble KdmgMat and FdmgVec and solve for displacement.
             PhaseFieldFractureSolver.AssembleKdmgMatFdmgVec();
             PhaseFieldFractureSolver.ComputeDamage();
+            PhaseFieldFractureSolver.SuppressBoundaryDamage();
 
             // Compute error in damage.
             damage_error = PhaseFieldFractureSolver.ComputeDamageError();
@@ -474,7 +476,7 @@ std::error_code logInFractureSim(json &inputParameters, matProps &fractureMatPro
 
     fractureMatProps.lameConstant = inputParameters["Physical Parameters"]["Lame Constant"];
     fractureMatProps.shearModulus = inputParameters["Physical Parameters"]["Shear Modulus"];
-    fractureMatProps.Gc = inputParameters["Physical Parameters"]["Gc"];
+    fractureMatProps.Gc = inputParameters["Physical Parameters"]["Fracture Toughness"];
     fractureMatProps.eps = inputParameters["Physical Parameters"]["epsilon"];
     fractureMatProps.Kepsilon = inputParameters["Physical Parameters"]["Kepsilon"];
 
@@ -544,11 +546,11 @@ int BoundaryConditions::determineDirichletDof(mfem::Array<int> &ess_tdof_listx, 
     ess_bdr_z = 0;
 
     // Select Dirichlet components.
-    ess_bdr_x[2] = 1;
-    ess_bdr_y[2] = 1;
-    ess_bdr_z[2] = 1;
+    ess_bdr_x[0] = 1;
+    ess_bdr_y[0] = 1;
+    ess_bdr_z[0] = 1;
 
-    ess_bdr_y[3] = 1;
+    ess_bdr_x[1] = 1;
 
     fespacebc->GetEssentialTrueDofs(ess_bdr_x, ess_tdof_listx, 0);
     fespacebc->GetEssentialTrueDofs(ess_bdr_y, ess_tdof_listy, 1);
@@ -653,16 +655,16 @@ int BoundaryConditions::projectDirichletVals(mfem::Array<int> &ess_tdof_listx, m
     disp_gf = 0.0;
 
     VectorArrayCoefficient dirichletBC(dim);
-    Vector dispbcx(pmesh->bdr_attributes.Max()), dispbcy(pmesh->bdr_attributes.Max());
-    dispbcy = 0.0;                      // First attribute is homogeneous dirichlet boundary.
-    dispbcy(3) = -(boundaryDisp[step]); // Second attribute is inhomogeneous dirichlet boundary.
+    Vector dispbc(pmesh->bdr_attributes.Max());
+    dispbc = 0.0;                     // First attribute is homogeneous dirichlet boundary.
+    dispbc(1) = (boundaryDisp[step]); // Second attribute is inhomogeneous dirichlet boundary.
 
-    dirichletBC.Set(0, new ConstantCoefficient(0.0));
-    dirichletBC.Set(1, new PWConstCoefficient(dispbcy));
+    dirichletBC.Set(0, new PWConstCoefficient(dispbc));
+    dirichletBC.Set(1, new ConstantCoefficient(0.0));
     if (dim == 3)
         dirichletBC.Set(2, new ConstantCoefficient(0.0));
 
-    disp_gf.ProjectBdrCoefficient(dirichletBC, ess_bdr_y); // Ahh this is useless if we want to have different dirichlet boundaries for each component of displacement.
+    disp_gf.ProjectBdrCoefficient(dirichletBC, ess_bdr_x); // Ahh this is useless if we want to have different dirichlet boundaries for each component of displacement.
 
     // mfem::Vector pt{0.0, 0.0, 0.0};
     // int i = 0;
@@ -819,6 +821,7 @@ void PhaseFieldSolver::AssembleKdmgMatFdmgVec() // Kdmg2Mat and FdmgVec depend o
     kdmg2->Update(damagefespace);
     kdmg2->Assemble();
     kdmg2->Finalize();
+
     Kdmg2Mat = (kdmg2->ParallelAssemble()); // Reassign the pointer. Ownership transferred.
 
     KdmgMat = Add(1.0, *Kdmg1Mat, 1.0, *Kdmg2Mat);
@@ -834,6 +837,7 @@ void PhaseFieldSolver::ComputeDamage()
     KdmgCG->SetPreconditioner(*KdmgPrec);
 
     KdmgCG->Mult(*FdmgVec, *d_vec2); // d_vec2 = KdmgMat^{-1} (F_dmgVec)
+    *d = *d_vec2;
 };
 
 double PhaseFieldSolver::ComputeDamageError()
@@ -852,4 +856,24 @@ double PhaseFieldSolver::ComputeDamageError()
     *d = *d_new;
 
     return global_damage_error;
+};
+
+void PhaseFieldSolver::SuppressBoundaryDamage()
+{
+    auto [num_dofs, dim, num_nodes] = GetNodeInfo(node_coords);
+
+    // This works. However, need to find the right condition. Which region can the damage be suppressed?
+    mfem::Vector pt{0.0, 0.0, 0.0};
+    for (int nd = 0; nd < num_nodes; nd++)
+    {
+        pt(0) = (*node_coords)(nd);
+        pt(1) = (*node_coords)(nd + num_nodes);
+        if (dim == 3)
+            pt(2) = (*node_coords)(nd + 2 * num_nodes);
+
+        if (pt(0) < 0.01 || pt(0) > (0.1 - 0.01))
+            (*d)(nd) = 0.0;
+    }
+
+    d->GetTrueDofs(*d_vec2);
 };
