@@ -1,5 +1,5 @@
 {
-        "testName": "VariationalFracture_testrun1",
+        "testName": "VariationalFracture_testrun2",
         "Simulation Parameters": {
                 "Error Tolerance": 1e-5,
                 "Maximum Iterations": 100,

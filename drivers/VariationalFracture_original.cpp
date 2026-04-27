@@ -73,7 +73,7 @@ protected:
     json inputFile;
     Array<int> ess_tdof_list;
     const mfem::GridFunction *node_coords;
-    ParGridFunction *u, *d, *h;
+    ParGridFunction *u, *d, *h; // u is H1(B, R3), d is H1(B, R), h is L2(B,R).
     ParMesh *pmesh;
     ParFiniteElementSpace *dispfespace, *damagefespace;
     ParBilinearForm *kdisp, *kdmg1, *kdmg2;
@@ -197,7 +197,9 @@ int main(int argc, char *argv[])
     pmesh->SetNodalFESpace(dispfespace);
     pmesh->EnsureNodes();
 
-    // Define L2 finite element spaces for strain and stress.
+    // Define L2 finite element space for history variable.
+    FiniteElementCollection *L2fec(new L2_FECollection(0, dim));
+    ParFiniteElementSpace *historyfespace = new ParFiniteElementSpace(pmesh, L2fec, 1);
 
     if (myid == 0)
         cout << "Initialized finite element spaces" << endl;
@@ -209,7 +211,7 @@ int main(int argc, char *argv[])
     u = 0.0;
     d = 0.0;
 
-    ParGridFunction h(damagefespace); // h is the grid function for the history variable.
+    ParGridFunction h(historyfespace); // h is the grid function for the history variable for each element, not node.
     h = 0.0;
 
     ParGridFunction hat_u_x_nodes(damagefespace), hat_u_y_nodes(damagefespace), hat_u_z_nodes(damagefespace);
@@ -280,7 +282,7 @@ int main(int argc, char *argv[])
     ParBilinearForm *kdmg1(new ParBilinearForm(damagefespace));
     kdmg1->AddDomainIntegrator(new MassIntegrator(g_over_eps_coeff));
     kdmg1->AddDomainIntegrator(new DiffusionIntegrator(g_times_eps_coeff));
-    kdmg1->AddDomainIntegrator(new MassIntegrator(viscosity_coeff));
+    // kdmg1->AddDomainIntegrator(new MassIntegrator(viscosity_coeff));
 
     // kdmg2
     // Computes the elastic energy at each quadrature point.
@@ -300,6 +302,7 @@ int main(int argc, char *argv[])
     // viscosity is \frac{\eta}{\Delta t} \phi
     ParLinearForm *fdmg(new ParLinearForm(damagefespace));
     fdmg->AddDomainIntegrator(new mfemplus::FractureDamageLFIntegrator(Ey_coeff, nu_coeff, viscosity_coeff, u, d, dispfespace));
+    // Viscosity turned off currently in mfemplus.
 
     if (myid == 0)
         cout << "Initialized bilinear and linear forms." << endl;
@@ -891,6 +894,9 @@ void PhaseFieldSolver::SuppressBoundaryDamage()
 
 void PhaseFieldSolver::ComputeHistoryVariable()
 {
+    // Compute history variable for each element, not for each node.
+    // Also compute strain energy for each element, not for each node. At least for now.
+    // Fill up an L2 grid function.
     mfemplus::AccessMFEMFunctions accessFunc;
 
     int num_elements = damagefespace->GetNE();
@@ -898,8 +904,7 @@ void PhaseFieldSolver::ComputeHistoryVariable()
     int dof, str_comp;
     str_comp = (dim == 2) ? 3 : 6;
 
-    Vector elvect, shape;
-    Vector eldofdisp, eldofdamage;
+    Vector eldofdisp;
     DenseMatrix dshape, gshape;
     Array<int> eldofs;
 
@@ -915,15 +920,11 @@ void PhaseFieldSolver::ComputeHistoryVariable()
 
         if (elnum == 0)
         {
-            shape.SetSize(dof); // vector of size dof
             dshape.SetSize(dof, dim);
             gshape.SetSize(dof, dim);
-            elvect.SetSize(dof);
-            elvect = 0.0;
 
             eldofs.SetSize(dof * dim);    // vector valued for displacement
             eldofdisp.SetSize(dof * dim); // vector valued displacement
-            eldofdamage.SetSize(dof);     // scalar valued damage
         }
 
         dispfespace->GetElementVDofs(elnum, eldofs);
@@ -936,7 +937,6 @@ void PhaseFieldSolver::ComputeHistoryVariable()
         // Next, construct the stiffness matrix C, compute displacement gradients, and take inner product.
 
         const mfem::IntegrationRule *ir = accessFunc.GetIntegrationRule(el, Trans);
-        double w, NU, E;
 
         if (elnum == 0)
         {
@@ -946,7 +946,10 @@ void PhaseFieldSolver::ComputeHistoryVariable()
             CBu.SetSize(str_comp);
             Bu.SetSize(str_comp);
         }
-        double strain_energy;
+
+        double NU, E, w;
+        double strain_energy(0.0), temp(0.0);
+        w = 1.0 / ir->GetNPoints(); // To take average of strain energy in the element.
 
         for (int i = 0; i < ir->GetNPoints(); i++)
         {
@@ -954,10 +957,9 @@ void PhaseFieldSolver::ComputeHistoryVariable()
 
             el.CalcDShape(ip, dshape);
             Trans.SetIntPoint(&ip);
-            el.CalcPhysShape(Trans, shape);
-            w = ip.weight * Trans.Weight(); // Quadrature weights
 
-            // NU = poisson_ratio->Eval(Trans, ip); // need to give coefficients to history variable.
+            // need to give coefficients to evaluate history variable.
+            // NU = poisson_ratio->Eval(Trans, ip);
             // E = young_mod->Eval(Trans, ip); // The elastic constants are evaluated at each integration point.
 
             mfem::Mult(dshape, Trans.InverseJacobian(), gshape); // Recovering the gradients of the shape functions in the physical space.
@@ -1020,11 +1022,14 @@ void PhaseFieldSolver::ComputeHistoryVariable()
             mfem::Mult(C, B, CB);    // CB is 6 x (dof * dim)
             CB.Mult(eldofdisp, CBu); // CBu has dimension strain_comps. This is the stress vector.
             B.Mult(eldofdisp, Bu);   // Bu has dimension strain_comps. This is the strain vector.
-            strain_energy = mfem::InnerProduct(CBu, Bu);
-
-            add(elvect, w * strain_energy, shape, elvect);
+            temp = mfem::InnerProduct(CBu, Bu);
+            strain_energy += w * temp;
         }
-
-        // Great, let this finish for all elements. Next, need to check with old gridfunction to see the maximum at each node and keep only that value... This seems like a bad/wasteful way to be doing this....
+        // Here, we need to check if old strain_energy, i.e. the magnitude of the number already stored by h is greater or less than the newly computed strain energy for this element. If the old one is greater, don't update. If new one is greater, update.
+        if (strain_energy > (*h)(elnum))
+        {
+            (*h)(elnum) = strain_energy;
+        } // Only updates if newly computed strain energy is greater.
     };
+    // This history grid function can be used in the bilinear and linear form integrators.
 };
