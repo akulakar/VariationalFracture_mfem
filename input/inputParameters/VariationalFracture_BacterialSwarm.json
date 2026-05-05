@@ -1,22 +1,27 @@
 {
         "testName": "VariationalFracture_bacterialSwarm1",
         "Simulation Parameters": {
-                "Error Tolerance": 1e-5,
-                "Maximum Iterations": 100,
+                "Error Tolerance": 1e-6,
+                "Maximum Iterations": 300,
+                "Viscosity": 0.02,
+                "Time Increment": 0.01,
                 "Mesh Parameters": {
-                        "meshFileName": "../input/meshes/circle_BacteriaSwarm-tri.mesh",
+                        "meshFileName": "../input/meshes/annulus2_bdrattr-tri.mesh",
                         "order": 1,
                         "ref_levels": 0
                 },
                 "Boundary Displacements": [0.0],
-                "Growth Increments": [0.0, 0.0, 0.0]
+                "Growth Increments": [0.0, 0.0, 0.0],
+                "Growth Constant 1": [0.0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12],
+                "Growth Constant 2": [0.0, 0.0056, 0.0066, 0.0076, 0.0086, 0.0096, 0.016],
+                "Growth Constant 3": [0.0, 0.01, 0.012, 0.014, 0.016, 0.018, 0.020],
+                "Growth Coefficient": 5.2e-1
         },
         "Physical Parameters": {
                 "Lame Constant": 28.0e4,
 		"Shear Modulus": 28.0e2,
-                "Growth Coefficient": 1.0e-4,
-                "Fracture Toughness": 0.5e6,
+                "Fracture Toughness": 5.0e-1,
                 "Kepsilon": 1e-8,
-                "epsilon" : 0.001 
+                "epsilon" : 0.0001 
         }
 }

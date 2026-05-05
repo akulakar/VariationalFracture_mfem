@@ -23,7 +23,6 @@ struct matProps
 {
     double lameConstant, shearModulus;
     double Ey, nu;
-    double alphaGrowth;
     double Gc;
     double eps;
     double Kepsilon;
@@ -34,7 +33,10 @@ struct simProps
     int N; // Number of steps
     double errorTol;
     int maxIterations;
+    double alphaGrowth, growthCoeff;
     vector<float> boundaryDisp, growthIncrements;
+    vector<float> growthC1, growthC2, growthC3;
+    double eta, Deltat; // viscosity and time increment.
 };
 
 std::tuple<int, int, int> GetNodeInfo(const mfem::GridFunction *nodes_ptr);
@@ -73,7 +75,7 @@ protected:
     json inputFile;
     Array<int> ess_tdof_list;
     const mfem::GridFunction *node_coords;
-    ParGridFunction *u, *d;
+    ParGridFunction *u, *d, *h;
     ParMesh *pmesh;
     ParFiniteElementSpace *dispfespace, *damagefespace;
     ParBilinearForm *kdisp, *kdmg1, *kdmg2;
@@ -84,9 +86,12 @@ protected:
     HypreBoomerAMG *KdispPrec, *KdmgPrec;
     HyprePCG *KdispCG, *KdmgCG;
     double local_damage_error, global_damage_error;
+    simProps fractureSimProps;
+    matProps fractureMatProps;
+    ConstantCoefficient Ey_coeff, nu_coeff;
 
 public:
-    PhaseFieldSolver(ParGridFunction &disp_gf, ParGridFunction &damage_gf) : u(&disp_gf), d(&damage_gf) {};
+    PhaseFieldSolver(simProps &simulationProps, matProps &materialProps, ParGridFunction &disp_gf, ParGridFunction &damage_gf, ParGridFunction &history_gf) : fractureSimProps(simulationProps), fractureMatProps(materialProps), u(&disp_gf), d(&damage_gf), h(&history_gf) {};
     void ReadFESpacesMeshEssDofs(ParFiniteElementSpace *disp_fes, ParFiniteElementSpace *damage_fes, ParMesh *pmesh_in, Array<int> &ess_dofs)
     {
         dispfespace = disp_fes;
@@ -94,6 +99,8 @@ public:
         pmesh = pmesh_in;
         ess_tdof_list = ess_dofs;
         node_coords = pmesh->GetNodes();
+        Ey_coeff = ConstantCoefficient(fractureMatProps.Ey);
+        nu_coeff = ConstantCoefficient(fractureMatProps.nu);
     };
     // Read bilinear and linear forms.
     void ReadBilinearLinearForms(ParBilinearForm *k_disp, ParBilinearForm *k_damage1, ParBilinearForm *k_damage2, ParLinearForm *f_disp, ParLinearForm *f_damage)
@@ -110,6 +117,7 @@ public:
     void AssembleKdispMatFdispVec();
     void ComputeDisp();
     void AssembleKdmg1Mat();
+    void ComputeHistoryVariable();
     void AssembleKdmgMatFdmgVec();
     void ComputeDamage();
     double ComputeDamageError();
@@ -174,7 +182,7 @@ int main(int argc, char *argv[])
     //------------------------------------------------------------------------------------------------------------------
 
     Mesh *mesh = new Mesh(mesh_file, 1, 1);
-    int dim = mesh->Dimension();      // dim should equal 3.
+    int dim = mesh->Dimension();      // dim should equal 2 or 3.
     mesh->SetCurvature(order, false); // Enable high-order geometry
     for (int l = 0; l < ref_levels; l++)
         mesh->UniformRefinement();
@@ -196,7 +204,9 @@ int main(int argc, char *argv[])
     pmesh->SetNodalFESpace(dispfespace);
     pmesh->EnsureNodes();
 
-    // Define L2 finite element spaces for strain and stress.
+    // Define L2 finite element space for history variable.
+    FiniteElementCollection *L2fec(new L2_FECollection(0, dim));
+    ParFiniteElementSpace *historyfespace = new ParFiniteElementSpace(pmesh, L2fec, 1);
 
     if (myid == 0)
         cout << "Initialized finite element spaces" << endl;
@@ -204,9 +214,10 @@ int main(int argc, char *argv[])
     // Define and initialize all grid functions
     //------------------------------------------------------------------------------------------------------------------
 
-    ParGridFunction u(dispfespace), d(damagefespace);
+    ParGridFunction u(dispfespace), d(damagefespace), h(historyfespace);
     u = 0.0;
     d = 0.0;
+    h = 0.0;
 
     ParGridFunction hat_u_x_nodes(damagefespace), hat_u_y_nodes(damagefespace), hat_u_z_nodes(damagefespace);
     hat_u_x_nodes = 0.0;
@@ -225,6 +236,12 @@ int main(int argc, char *argv[])
     const int vdim = nodes->VectorDim(); // Should be 3 for 2D
     const int num_nodes = nodes->Size() / vdim;
     const int num_els = dispfespace->GetNE();
+    const int str_comp = (dim == 2 ? 3 : 6);
+    if (myid == 0)
+    {
+        cout << "Number of elements is: " << num_els << endl;
+        cout << "Number of nodes is: " << num_nodes << endl;
+    }
 
     //------------------------------------------------------------------------------------------------------------------
     // Read boundary attributes and determine essential (Dirichlet) dofs.
@@ -270,10 +287,12 @@ int main(int argc, char *argv[])
 
     // kdmg1
     ConstantCoefficient g_over_eps_coeff(fractureMatProps.Gc / fractureMatProps.eps), g_times_eps_coeff(fractureMatProps.Gc * fractureMatProps.eps);
+    ConstantCoefficient viscosity_coeff(fractureSimProps.eta / fractureSimProps.Deltat);
     // Assembled only once in the simulation.
     ParBilinearForm *kdmg1(new ParBilinearForm(damagefespace));
     kdmg1->AddDomainIntegrator(new MassIntegrator(g_over_eps_coeff));
     kdmg1->AddDomainIntegrator(new DiffusionIntegrator(g_times_eps_coeff));
+    kdmg1->AddDomainIntegrator(new MassIntegrator(viscosity_coeff));
 
     // kdmg2
     // Computes the elastic energy at each quadrature point.
@@ -284,31 +303,53 @@ int main(int argc, char *argv[])
     // Linear forms
 
     // fdisp
-    // Include a force due to growth term. Eigenstrain.
-    ConstantCoefficient growthCoefficient(fractureSimProps.growthIncrements[0] * fractureMatProps.alphaGrowth);
+    // Include a force due to growth term. Eigenstrain. Need to make this a function coefficient, as a function of radius r.
+    int stepNum = 0;
     ConstantCoefficient zero(0.0);
-    VectorArrayCoefficient growthVectorCoeff(dim * dim); // 9 terms for 3D, 4 terms for 2D.
+    // ConstantCoefficient growthCoefficient(fractureSimProps.growthIncrements[0] * fractureMatProps.alphaGrowth);
+    // body force needs to be a radial function...
+    FunctionCoefficient growthCoefficient_shear([&fractureSimProps, &fractureMatProps, &stepNum](const Vector &coords)
+                                                {
+        double x = coords(0);
+        double y = coords(1);
+        double rad = std::sqrt(x*x + y*y); 
+        double theta = std::atan2(y,x);
+        double bodyforce = std::cos(2*theta) * fractureSimProps.alphaGrowth * (fractureSimProps.growthC1[stepNum] * std::log(rad / 0.025) + fractureSimProps.growthC2[stepNum] * pow(rad,3.0) + fractureSimProps.growthC3[stepNum]);
+        return bodyforce; });
+
+    FunctionCoefficient growthCoefficient_normal([&fractureSimProps, &fractureMatProps, &stepNum](const Vector &coords)
+                                                 {
+        double x = coords(0);
+        double y = coords(1);
+        double rad = std::sqrt(x*x + y*y); 
+        double bodyforce = fractureSimProps.alphaGrowth * (fractureSimProps.growthC1[stepNum] * std::log(rad / 0.0175) + fractureSimProps.growthC2[stepNum] * pow(rad,3.0) + fractureSimProps.growthC3[stepNum]);
+        return bodyforce; });
+
+    VectorArrayCoefficient growthVectorCoeff(str_comp); // 9 terms for 3D, 4 terms for 2D.
     if (dim == 2)
     {
-        growthVectorCoeff.Set(0, &growthCoefficient, false);
-        growthVectorCoeff.Set(1, &zero, false);
-        growthVectorCoeff.Set(2, &zero, false);
-        growthVectorCoeff.Set(3, &growthCoefficient, false);
+        growthVectorCoeff.Set(0, &growthCoefficient_normal, false);
+        growthVectorCoeff.Set(1, &growthCoefficient_normal, false);
+        growthVectorCoeff.Set(2, &growthCoefficient_shear, false);
     }
     else if (dim == 3)
     {
-        growthVectorCoeff.Set(0, &growthCoefficient, false);
-        growthVectorCoeff.Set(4, &growthCoefficient, false);
-        growthVectorCoeff.Set(8, &growthCoefficient, false);
+        growthVectorCoeff.Set(0, &growthCoefficient_normal, false);
+        growthVectorCoeff.Set(1, &growthCoefficient_normal, false);
+        growthVectorCoeff.Set(2, &growthCoefficient_normal, false);
+        growthVectorCoeff.Set(3, &growthCoefficient_shear, false);
+        growthVectorCoeff.Set(4, &growthCoefficient_shear, false);
+        growthVectorCoeff.Set(5, &growthCoefficient_shear, false);
     }
     ParLinearForm *fdisp(new ParLinearForm(dispfespace));
-    // If growth term is needed, include a body force.
-    fdisp->AddDomainIntegrator(new VectorDomainLFGradIntegrator(growthVectorCoeff));
+    // If growth term is needed, include a body force. Ohh wait. Damage also needs to be included...
+    // Write a custom integrator.
+    fdisp->AddDomainIntegrator(new mfemplus::EigenstrainBodyForceLFIntegrator(Ey_coeff, nu_coeff, growthVectorCoeff));
 
     // fdmg
     // Computes the elastic energy at each quadrature point.
     ParLinearForm *fdmg(new ParLinearForm(damagefespace));
-    // fdmg->AddDomainIntegrator(new mfemplus::FractureDamageLFIntegrator(Ey_coeff, nu_coeff, viscosity_coeff, u, d, dispfespace));
+    fdmg->AddDomainIntegrator(new mfemplus::FractureDamageLFIntegrator(Ey_coeff, nu_coeff, viscosity_coeff, u, d, dispfespace));
 
     if (myid == 0)
         cout << "Initialized bilinear and linear forms." << endl;
@@ -319,16 +360,16 @@ int main(int argc, char *argv[])
     adios2stream aos(resultsFolder + "/WavesMFEMoutput.bp", adios2stream::openmode::out, MPI_COMM_WORLD, "BP5");
     {
         aos.SetRefinementLevel(0);
-        aos.SetParameter("FlushStepsCount", "5");
+        aos.SetParameter("FlushStepsCount", "1");
         aos.BeginStep();
         pmesh->Print(aos);
         aos.SetCycle(0);
         // Write fields
         u.Save(aos, "disp", adios2stream::data_type::point_data);
         d.Save(aos, "damage", adios2stream::data_type::point_data);
-        hat_u_x_nodes.Save(aos, "hat_u_x_nodes", adios2stream::data_type::point_data);
-        hat_u_y_nodes.Save(aos, "hat_u_y_nodes", adios2stream::data_type::point_data);
-        hat_u_z_nodes.Save(aos, "hat_u_z_nodes", adios2stream::data_type::point_data);
+        // hat_u_x_nodes.Save(aos, "hat_u_x_nodes", adios2stream::data_type::point_data);
+        // hat_u_y_nodes.Save(aos, "hat_u_y_nodes", adios2stream::data_type::point_data);
+        // hat_u_z_nodes.Save(aos, "hat_u_z_nodes", adios2stream::data_type::point_data);
         aos.EndStep();
     }
 
@@ -339,7 +380,7 @@ int main(int argc, char *argv[])
     // Initialize the main phase field solver object and begin iterations.
     //------------------------------------------------------------------------------------------------------------------
 
-    PhaseFieldSolver PhaseFieldFractureSolver(u, d);
+    PhaseFieldSolver PhaseFieldFractureSolver(fractureSimProps, fractureMatProps, u, d, h);
     PhaseFieldFractureSolver.ReadFESpacesMeshEssDofs(dispfespace, damagefespace, pmesh, ess_tdof_list);
     PhaseFieldFractureSolver.ReadBilinearLinearForms(kdisp, kdmg1, kdmg2, fdisp, fdmg);
     PhaseFieldFractureSolver.InitializeMatricesVectors();
@@ -360,6 +401,9 @@ int main(int argc, char *argv[])
         damage_error = 1.0;
         iterations = 0;
 
+        // Reset step num for growth.
+        stepNum = step;
+
         while (damage_error >= fractureSimProps.errorTol && iterations <= fractureSimProps.maxIterations)
         {
             iterations++;
@@ -368,8 +412,6 @@ int main(int argc, char *argv[])
 
             // Project essential bcs.
             BCs.projectDirichletVals(ess_tdof_listbcx, ess_tdof_listbcy, ess_tdof_listbcz, hat_u_x, hat_u_y, hat_u_z, u, step);
-            // Reset growth coeff.
-            growthCoefficient = ConstantCoefficient(fractureSimProps.growthIncrements[step] * fractureMatProps.alphaGrowth);
 
             // Assemble KdispMat and FdispVec and solve for displacement.
             PhaseFieldFractureSolver.AssembleKdispMatFdispVec();
@@ -378,7 +420,9 @@ int main(int argc, char *argv[])
             // Assemble KdmgMat and FdmgVec and solve for displacement.
             PhaseFieldFractureSolver.AssembleKdmgMatFdmgVec();
             PhaseFieldFractureSolver.ComputeDamage();
-            PhaseFieldFractureSolver.SuppressBoundaryDamage();
+
+            // Suppress bdr damage if necessary.
+            // PhaseFieldFractureSolver.SuppressBoundaryDamage();
 
             // Compute error in damage.
             damage_error = PhaseFieldFractureSolver.ComputeDamageError();
@@ -496,7 +540,6 @@ std::error_code logInFractureSim(json &inputParameters, matProps &fractureMatPro
 
     fractureMatProps.lameConstant = inputParameters["Physical Parameters"]["Lame Constant"];
     fractureMatProps.shearModulus = inputParameters["Physical Parameters"]["Shear Modulus"];
-    fractureMatProps.alphaGrowth = inputParameters["Physical Parameters"]["Growth Coefficient"];
     fractureMatProps.Gc = inputParameters["Physical Parameters"]["Fracture Toughness"];
     fractureMatProps.eps = inputParameters["Physical Parameters"]["epsilon"];
     fractureMatProps.Kepsilon = inputParameters["Physical Parameters"]["Kepsilon"];
@@ -504,22 +547,26 @@ std::error_code logInFractureSim(json &inputParameters, matProps &fractureMatPro
     double E, NU, growthCoeff;
     E = (fractureMatProps.shearModulus * (3 * fractureMatProps.lameConstant + 2 * fractureMatProps.shearModulus)) / (fractureMatProps.lameConstant + fractureMatProps.shearModulus);
     NU = fractureMatProps.lameConstant / (2 * (fractureMatProps.lameConstant + fractureMatProps.shearModulus));
-
-    growthCoeff = (fractureMatProps.Ey * fractureMatProps.alphaGrowth * (1 + fractureMatProps.nu)) / (1.0 - fractureMatProps.nu * (1 + 2.0 * fractureMatProps.nu));
-
-    double h = mesh->GetElementSize(1, /*type=*/1);
-
     fractureMatProps.Ey = E;
     fractureMatProps.nu = NU;
+    fractureSimProps.alphaGrowth = inputParameters["Simulation Parameters"]["Growth Coefficient"];
+    fractureSimProps.growthCoeff = (fractureMatProps.Ey * fractureSimProps.alphaGrowth * (1 + fractureMatProps.nu)) / (1.0 - fractureMatProps.nu * (1 + 2.0 * fractureMatProps.nu));
+
+    double h = mesh->GetElementSize(1, /*type=*/1);
 
     if (myid == 0)
         cout << "Physical parameters read" << endl;
 
     fractureSimProps.errorTol = inputParameters["Simulation Parameters"]["Error Tolerance"];
     fractureSimProps.maxIterations = inputParameters["Simulation Parameters"]["Maximum Iterations"];
+    fractureSimProps.eta = inputParameters["Simulation Parameters"]["Viscosity"];
+    fractureSimProps.Deltat = inputParameters["Simulation Parameters"]["Time Increment"];
     fractureSimProps.boundaryDisp = inputParameters["Simulation Parameters"]["Boundary Displacements"].get<std::vector<float>>();
-    fractureSimProps.growthIncrements = inputParameters["Simulation Parameters"]["Growth Increments"].get<std::vector<float>>();
-    fractureSimProps.N = (fractureSimProps.growthIncrements).size();
+    fractureSimProps.growthC1 = inputParameters["Simulation Parameters"]["Growth Constant 1"].get<std::vector<float>>();
+    fractureSimProps.growthC2 = inputParameters["Simulation Parameters"]["Growth Constant 2"].get<std::vector<float>>();
+    fractureSimProps.growthC3 = inputParameters["Simulation Parameters"]["Growth Constant 3"].get<std::vector<float>>();
+    vector<float> growthC1, growthC2, growthC3;
+    fractureSimProps.N = (fractureSimProps.growthC1).size();
 
     if (myid == 0)
         cout
@@ -579,7 +626,8 @@ int BoundaryConditions::determineDirichletDof(mfem::Array<int> &ess_tdof_listx, 
 
     fespacebc->GetEssentialTrueDofs(ess_bdr_x, ess_tdof_listx, 0);
     fespacebc->GetEssentialTrueDofs(ess_bdr_y, ess_tdof_listy, 1);
-    fespacebc->GetEssentialTrueDofs(ess_bdr_z, ess_tdof_listz, 2);
+    if (dim == 3)
+        fespacebc->GetEssentialTrueDofs(ess_bdr_z, ess_tdof_listz, 2);
 
     // fespacebc->GetEssentialTrueDofs(ess_bdr_x, bdr_nodes_list_x, 0);
     // fespacebc->GetEssentialTrueDofs(ess_bdr_y, bdr_nodes_list_y, 1);
@@ -662,10 +710,10 @@ double BoundaryConditions::hat_u_x_func(const mfem::Vector &pt, int &step)
 
 double BoundaryConditions::hat_u_y_func(const mfem::Vector &pt, int &step)
 {
-    if (pt(1) >= (0.04 - 0.0001) /*&& std::abs(pt(1) - 0.05) <= 0.0001*/)
-        return -boundaryDisp[step]; // Step dependent inhomogeneous Dirichlet condition
-    else
-        return 0.0;
+    // if (pt(1) >= (0.04 - 0.0001) /*&& std::abs(pt(1) - 0.05) <= 0.0001*/)
+    //     return -boundaryDisp[step]; // Step dependent inhomogeneous Dirichlet condition
+    // else
+    return 0.0;
 }
 
 double BoundaryConditions::hat_u_z_func(const mfem::Vector &pt, int &step)
@@ -680,11 +728,11 @@ int BoundaryConditions::projectDirichletVals(mfem::Array<int> &ess_tdof_listx, m
     disp_gf = 0.0;
 
     VectorArrayCoefficient dirichletBC(dim);
-    Vector dispbc(pmesh->bdr_attributes.Max());
-    dispbc = 0.0;                     // First attribute is homogeneous dirichlet boundary.
-    dispbc(1) = (boundaryDisp[step]); // Second attribute is inhomogeneous dirichlet boundary.
+    // Vector dispbc(pmesh->bdr_attributes.Max());
+    // dispbc = 0.0;                     // First attribute is homogeneous dirichlet boundary.
+    // dispbc(1) = (boundaryDisp[step]); // Second attribute is inhomogeneous dirichlet boundary.
 
-    dirichletBC.Set(0, new PWConstCoefficient(dispbc));
+    dirichletBC.Set(0, new ConstantCoefficient(0.0));
     dirichletBC.Set(1, new ConstantCoefficient(0.0));
     if (dim == 3)
         dirichletBC.Set(2, new ConstantCoefficient(0.0));
@@ -794,6 +842,8 @@ void PhaseFieldSolver::InitializeSolvers()
     KdispPrec->SetRelaxType(6); // Symm. Gauss-Seidel
     KdispPrec->SetCycleType(1);
 
+    KdispPrec->SetElasticityOptions(dispfespace);
+
     KdmgPrec->SetPrintLevel(0);
     KdmgPrec->SetRelaxType(6); // Symm. Gauss-Seidel
     KdmgPrec->SetCycleType(1);
@@ -901,4 +951,146 @@ void PhaseFieldSolver::SuppressBoundaryDamage()
     }
 
     d->GetTrueDofs(*d_vec2);
+};
+
+void PhaseFieldSolver::ComputeHistoryVariable()
+{
+    // Compute history variable for each element, not for each node.
+    // Also compute strain energy for each element, not for each node. At least for now.
+    // Fill up an L2 grid function.
+    mfemplus::AccessMFEMFunctions accessFunc;
+
+    int num_elements = damagefespace->GetNE();
+    auto [num_dofs, dim, num_nodes] = GetNodeInfo(node_coords);
+    int dof, str_comp;
+    str_comp = (dim == 2) ? 3 : 6;
+
+    Vector eldofdisp;
+    DenseMatrix dshape, gshape;
+    Array<int> eldofs;
+
+    DenseMatrix C, B, CB; // stiffness, strain-displacement, Stiffness times strain-displacement in Voigt form
+    Vector CBu, Bu;
+
+    for (int elnum = 0; elnum < num_elements; elnum++)
+    {
+        const FiniteElement &el = *(damagefespace->GetFE(elnum));
+        ElementTransformation &Trans = *(damagefespace->GetElementTransformation(elnum));
+
+        dof = el.GetDof();
+
+        if (elnum == 0)
+        {
+            dshape.SetSize(dof, dim);
+            gshape.SetSize(dof, dim);
+
+            eldofs.SetSize(dof * dim);    // vector valued for displacement
+            eldofdisp.SetSize(dof * dim); // vector valued displacement
+        }
+
+        dispfespace->GetElementVDofs(elnum, eldofs);
+
+        for (int i = 0; i < eldofdisp.Size(); i++)
+        {
+            eldofdisp(i) = (*d)(eldofs[i]);
+        }
+        // Great, now we have all components of displacements at each dof.
+        // Next, construct the stiffness matrix C, compute displacement gradients, and take inner product.
+
+        const mfem::IntegrationRule *ir = accessFunc.GetIntegrationRule(el, Trans);
+
+        if (elnum == 0)
+        {
+            C.SetSize(str_comp, str_comp);
+            B.SetSize(str_comp, dof * dim);
+            CB.SetSize(str_comp, dof * dim);
+            CBu.SetSize(str_comp);
+            Bu.SetSize(str_comp);
+        }
+
+        double NU, E, w;
+        double strain_energy(0.0), temp(0.0); // Initialized to 0, good.
+        w = 1.0 / ir->GetNPoints();           // To take average of strain energy in the element.
+
+        for (int i = 0; i < ir->GetNPoints(); i++)
+        {
+            const mfem::IntegrationPoint &ip = ir->IntPoint(i);
+
+            el.CalcDShape(ip, dshape);
+            Trans.SetIntPoint(&ip);
+            if (elnum == 0 && i == 0)
+            {
+                NU = nu_coeff.Eval(Trans, ip);
+                E = Ey_coeff.Eval(Trans, ip); // The elastic constants are evaluated at each integration point.
+            }
+
+            mfem::Mult(dshape, Trans.InverseJacobian(), gshape); // Recovering the gradients of the shape functions in the physical space.
+
+            // Here we want to use Voigt notation to speed up the assembly process.
+            // For this, we need the strain displacement matrix B. The element stiffness can be computed as
+            // \int_{\Omega} B^T C B. In Voigt form, the stiffness matrix has dimensions 3 x 3 in 2D and 6 x 6 in 3D.
+            // The B matrix as 3 rows in 2D and 6 rowd in 3D.
+
+            if (dim == 2)
+            {
+                C = 0.0;
+                // Plane strain
+                // C(0, 0) = C(1, 1) = E * (1 - NU) / ((1 + NU) * (1 - 2 * NU));
+                // C(0, 1) = C(1, 0) = E * NU / ((1 + NU) * (1 - 2 * NU));
+                // C(2, 2) = E / (2 * (1 + NU));
+
+                // Plane stress
+                C(0, 0) = C(1, 1) = (E / (1 - pow(NU, 2)));
+                C(0, 1) = C(1, 0) = (E * NU / (1 - pow(NU, 2)));
+                C(2, 2) = (E * (1 - NU) / (2 * (1 - pow(NU, 2))));
+
+                // In 2D, we have 3 unique strain components.
+                B = 0.0;
+                for (int spf = 0; spf < dof; spf++)
+                {
+                    B(0, spf) = gshape(spf, 0);
+                    B(1, spf + dof) = gshape(spf, 1);
+                    B(2, spf) = gshape(spf, 1);
+                    B(2, spf + dof) = gshape(spf, 0);
+                }
+            }
+
+            else if (dim == 3)
+            {
+                C = 0.0;
+                C(0, 0) = C(1, 1) = C(2, 2) = (E * (1 - NU)) / ((1 - 2 * NU) * (1 + NU));
+                C(0, 1) = C(0, 2) = C(1, 0) = C(1, 2) = C(2, 0) = C(2, 1) = (E * NU) / ((1 - 2 * NU) * (1 + NU));
+                C(3, 3) = C(4, 4) = C(5, 5) = E / (2 * (1 + NU));
+
+                // In 3D, we have 6 unique strain components.
+                B = 0.0;
+                for (int spf = 0; spf < dof; spf++)
+                {
+                    B(0, spf) = gshape(spf, 0);
+                    B(1, spf + dof) = gshape(spf, 1);
+                    B(2, spf + 2 * dof) = gshape(spf, 2);
+                    B(3, spf + dof) = gshape(spf, 2);
+                    B(3, spf + 2 * dof) = gshape(spf, 1);
+                    B(4, spf) = gshape(spf, 2);
+                    B(4, spf + 2 * dof) = gshape(spf, 0);
+                    B(5, spf) = gshape(spf, 1);
+                    B(5, spf + dof) = gshape(spf, 0);
+                }
+            }
+
+            // Now compute the quantity C_{ijkl} u_{k,l} u_{i,j}. Using Voigt notation, of course...
+            // This is equivalent to.
+            mfem::Mult(C, B, CB);    // CB is 6 x (dof * dim)
+            CB.Mult(eldofdisp, CBu); // CBu has dimension strain_comps. This is the stress vector.
+            B.Mult(eldofdisp, Bu);   // Bu has dimension strain_comps. This is the strain vector.
+            temp = mfem::InnerProduct(CBu, Bu);
+            strain_energy += w * temp;
+        }
+        // Here, we need to check if old strain_energy, i.e. the magnitude of the number already stored by h is greater or less than the newly computed strain energy for this element. If the old one is greater, don't update. If new one is greater, update.
+        if (strain_energy > (*h)(elnum))
+        {
+            (*h)(elnum) = strain_energy;
+        } // Only updates if newly computed strain energy is greater.
+    };
+    // This history grid function can be used in the bilinear and linear form integrators.
 };

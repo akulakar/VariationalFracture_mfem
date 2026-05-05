@@ -1,22 +1,24 @@
 {
-        "testName": "VariationalFracture_testrun2",
+        "testName": "VariationalFracture_asymmetric_notch_bending_3",
         "Simulation Parameters": {
                 "Error Tolerance": 1e-5,
                 "Maximum Iterations": 100,
-                "Viscosity": 0.02,
-                "Time Increment": 0.01,
                 "Mesh Parameters": {
-                        "meshFileName": "../input/meshes/SlabWithNotch2-tet.mesh",
+                        "meshFileName": "../input/meshes/asymmetric_notch_bdrattr-quad.mesh",
                         "order": 1,
-                        "ref_levels": 1
+                        "ref_levels": 0
                 },
-                "Boundary Displacements": [0.0, 0.00025, 0.0005, 0.0075, 0.001, 0.00125, 0.0015]
+                "Boundary Displacements": [0.0, 0.00025],
+                "Boundary Tractions": [0.0],
+                "Final Displacement": -0.5,
+                "Minimum Displacement Increment": -5e-6,
+                "Maximum Displacement Increment": -0.01
         },
         "Physical Parameters": {
-                "Lame Constant": 28.0e9,
-		"Shear Modulus": 28.0e9,
-                "Fracture Toughness": 0.5e6,
-                "Kepsilon": 1e-8,
-                "epsilon" : 0.01 
+                "Lame Constant": 11.9967e3,
+		"Shear Modulus": 8.0e3,
+                "Fracture Toughness": 1.0,
+                "K Variable": 0.001,
+                "Length Scale" : 0.01
         }
 }
